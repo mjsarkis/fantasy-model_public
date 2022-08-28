@@ -1,0 +1,653 @@
+---
+title: "final project 540"
+author: "Michael Sarkis"
+date: "11/11/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rvest)
+library(tidyverse)
+library(jsonlite)
+library(randomForest)
+library(brms)
+library(tidybayes)
+library(rstan)
+library(lme4)
+library(Metrics)
+library(merTools)
+library(splitstackshape)
+rstan_options(auto_write = TRUE)
+options(mc.cores = 4)
+```
+
+```{r}
+#Gets football data
+for(i in 2008:2021){
+test<- read_html(paste0("https://www.pro-football-reference.com/years/",i,"/fantasy.htm")) %>% 
+  html_nodes(css = "tr td")%>%
+  html_text()
+test
+#makes first DF
+df <- as.data.frame(matrix(test, ncol = 32, byrow = TRUE))
+#adds column names
+names(df) <- c("player","team", "fantasy_pos","age", "g","gs","pass_cmp",
+"pass_att","pass_yds",
+"pass_td","pass_int","rush_att","rush_yds","rush_yds_per_att",
+"rush_td","targets","rec","rec_yds","rec_yds_per_rec",
+"rec_td","fumbles","fumbles_lost","all_td","two_pt_md",
+"two_pt_pass","fantasy_points","fantasy_points_ppr",
+"draftkings_points","fanduel_points","vbd","fantasy_rank_pos",
+"fantasy_rank_overall")
+#cleans player names
+df$player<-gsub("\\s?\\*?\\+?$","",df$player)
+#gives specific name
+assign(paste0("DF_", i), df)
+}
+```
+
+```{r}
+##function to add in next years fantasy data
+next_years <-function(df,df2){
+  holder <- dplyr::select(df2, player,fantasy_points_ppr,fantasy_pos)%>%
+    rename(next_fantasy_points_ppr = fantasy_points_ppr)%>%
+    right_join(df,by = c("player","fantasy_pos"))
+  holder
+}
+
+##loop that adds next years data to all DFs
+football <-lapply ( ls(patt='^DF_'), get)
+for(i in 1:13){
+  holder = next_years(football[[i]],football[[i+1]])
+  holder = holder[!(is.na(holder$next_fantasy_points_ppr) |
+                      holder$next_fantasy_points_ppr==""), ]
+  holder$fantasy_points_ppr <- as.numeric(holder$fantasy_points_ppr)
+  holder = holder %>% arrange(desc(fantasy_points_ppr)) #testing including all%>% slice(1:300)
+  year = 2007+i
+  assign(paste0("data_full_", year), holder)
+}
+
+##Sets all numeric columns to numeric,drops useless daily fantasy columns
+#filters out anyone with minimal fantasy points
+football_new <-lapply ( ls(patt='^data_full'), get)
+for(i in 1:13){
+  holder2 = football_new[[i]]
+  year = 2007+i
+  holder2["year"] = year
+  cols.num <- c('next_fantasy_points_ppr',"age", "g","gs","pass_cmp",
+                "pass_att","pass_yds",
+                "pass_td","pass_int","rush_att","rush_yds","rush_yds_per_att",
+                "rush_td","targets","rec","rec_yds","rec_yds_per_rec",
+                "rec_td","fumbles","fumbles_lost","all_td","two_pt_md",
+                "two_pt_pass","fantasy_points_ppr","vbd","year")
+  holder2[cols.num] <- sapply(holder2[cols.num],as.numeric)
+  holder2_new = holder2 %>%
+    dplyr::select("player","year",'next_fantasy_points_ppr',"team", "fantasy_pos","age", "g","gs","pass_cmp",
+              "pass_att","pass_yds",
+              "pass_td","pass_int","rush_att","rush_yds","rush_yds_per_att",
+              "rush_td","targets","rec","rec_yds","rec_yds_per_rec",
+              "rec_td","fumbles","fumbles_lost","all_td","two_pt_md",
+              "two_pt_pass","fantasy_points_ppr","vbd")%>%
+    filter(fantasy_points_ppr > .5)
+  
+  assign(paste0("clean_data_", year), holder2_new)
+}
+
+#combines all data int one DF
+full_data = rbind(clean_data_2008,
+                  clean_data_2009, clean_data_2010, clean_data_2011,
+                  clean_data_2012, clean_data_2013, clean_data_2014, 
+                  clean_data_2015, clean_data_2016, clean_data_2017,
+                  clean_data_2018, clean_data_2019, clean_data_2020)
+full_data[is.na(full_data)]<-0
+full_data["year"] <- sapply(full_data["year"],as.character)
+```
+
+
+```{r}
+#gets salary data
+position_html <- c("quarterback","running-back","fullback",
+                   "wide-receiver","tight-end")
+position_column <-c("QB","RB","RB","WR","TE")
+
+#function to clean data
+clean_salary <- function(data,position){
+      data <- data %>% dplyr::select(-c("V5","V9","V11"))
+      names(data) <- c("player","team", "year_signed","length","value","apy",
+                       "garanteed","%_of_cap","inflated_value",
+                       "inflated_apy","inflated_garunteed")
+      #fix data os numbers are numbers
+      data$length<-as.numeric(data$length)
+      data$value <- parse_number(data$value)
+      data$apy <- parse_number(data$apy)
+      data$garanteed <- parse_number(data$garanteed)
+      data$`%_of_cap`<- parse_number(data$`%_of_cap`)
+      data$inflated_value <- parse_number(data$inflated_value)
+      data$inflated_apy <- parse_number(data$inflated_apy)
+      data$inflated_garunteed <- parse_number(data$inflated_garunteed)
+      data$position <- position
+      return(data)
+  }
+
+#scrapes salary data and combines
+for(i in 1:5){
+    salary<- read_html(paste0("https://overthecap.com/contract-history/",
+                            position_html[i],
+                            "/")) %>% 
+    html_nodes(css = "tr td")%>%
+    html_text()
+    df_sal <- as.data.frame(matrix(salary, ncol = 14, byrow = TRUE)) 
+    df_sal <- clean_salary(df_sal,position_column[i])
+    if(i == 1){
+     salary_data <- df_sal
+    }
+    else{
+    salary_data<-rbind(salary_data,df_sal)
+    }
+}
+#fixes one specific error
+salary_data[salary_data$player== "Lache Seastrunk",]$length = 1
+```
+
+```{r}
+#merge salary and full data
+#max salary for a given year is used others are ignored
+
+#a player is assumed to be playing on their same contract unless 
+
+#another one is present for them
+
+#if the year signed is 0 the salary is dropped.
+#merge on player, year signed and fantasy pos
+salary_data<- salary_data %>%
+  filter(year_signed != "0")%>%
+  group_by(player,year_signed)%>%top_n(1,apy)%>%slice(1)
+full_data2 <- left_join(x = full_data,y = salary_data,c("player"="player",
+                                                        "year"="year_signed", 
+                                                        "fantasy_pos" = "position"))
+```
+
+```{r}
+#fills in apy and contract lengths for players who has fantasy data in the year the signed a contract
+full_data2 <- full_data2 %>% 
+  arrange(player,year)%>%
+  group_by(player,fantasy_pos)%>%
+  fill(apy,length)
+
+#this is done to account for contract igned before a player was fantasy relevant
+#copies rows of players for each year of contract
+salary_ex <-expandRows(salary_data,count=4,count.is.col = T,drop = F)
+
+#makes year numeric to order easier
+salary_ex$year_signed <-as.numeric(salary_ex$year_signed)
+salary_ex$year <- salary_ex$year_signed
+#edits the year on copied rows so that the year will increment for each year of contract
+for(i in 1:30){
+salary_ex<- salary_ex %>% group_by(player,year_signed)%>% mutate(year = 1+lag(year,default = year[1]-1))
+}
+#drops useless columns
+salary_ex <- salary_ex %>%
+  dplyr::select(player,year_signed,length,apy,position,year)
+salary_ex$year<-as.character(salary_ex$year)
+
+#merges this extended data with original data
+full_data2 <- left_join(x = full_data2,
+                             y = salary_ex,c("player"="player",
+                                             "year"="year", 
+                                             "fantasy_pos" = "position"))
+#fills in missing APYs with the new apy from the expanded data
+full_data2$apy <- ifelse(is.na(full_data2$apy.x), full_data2$apy.y, full_data2$apy.x)
+
+#same with length
+full_data2$length <- ifelse(is.na(full_data2$length.x), full_data2$length.y, full_data2$length.x)
+
+full_data2<- full_data2%>% #filter(!is.na(apy))
+  group_by(player,fantasy_pos,year)%>%top_n(1,year_signed)
+
+```
+
+```{r}
+cols_to_keep <- c("player","year","next_fantasy_points_ppr","fantasy_points_ppr","team.x",
+                  "fantasy_pos","age","g","gs","apy","length")
+full_data2 <- full_data2 %>% dplyr::select(all_of(cols_to_keep))
+new <- full_data2
+
+
+new[new$team.x == "STL",]$team.x = "LAR"
+new[new$team.x == "SDG",]$team.x = "LAC"
+new$age <- as.factor(new$age)
+new_dat<-new
+new_dat$year <- new_dat$year[,1]
+
+
+uhh <- fct_lump(new_dat$age,n = 14, other_level = "35+")
+new_dat$age2 <- uhh
+new_dat$age <- new_dat$age2
+names(new_dat)[names(new_dat) == 'team.x'] <- 'team'
+
+new_dat<- new_dat %>% group_by(player, fantasy_pos) %>% mutate(tenure = row_number())
+
+#had to cut the number of years as pre 2012 did not have good salary data
+year_split <-new_dat %>% group_by(year)%>% summarise(n = n())
+new_dat <- new_dat %>% filter(year>2011)
+
+```
+
+
+```{r}
+
+new_dat %>%
+ggplot(aes(x = next_fantasy_points_ppr))+geom_histogram(bins = 100)+
+  labs(title = "Next Year Fantasy Point Distribution",
+       subtitle = "Red Line is the logistic cutoff",
+       x = "Fantasy Points", y = "",caption = "Fig 1")+
+  geom_vline(xintercept = 20,color = "red")+theme_bw()
+
+new_dat$zero <- new_dat$next_fantasy_points_ppr<=15
+zeros <- new_dat %>% group_by(zero) %>% summarise(n = n())
+write.csv(new_dat,"D:\\Duke\\STA 540\\football_data.csv", row.names = FALSE)
+```
+
+
+```{r}
+#game average 
+ggplot(data = new_dat, aes(y = next_fantasy_points_ppr,x =fantasy_points_ppr))+
+  geom_point()+labs(title = "Next Year Fantasy vs Last year fantasy points")+geom_abline(slope = 1,color = "red")
+
+```
+```{r}
+new_dat %>% 
+#  filter(team %in% c("3TM","2TM","CAR","NYJ","CLE","LAC","NOR","NWE"))%>%
+ggplot(aes(y = next_fantasy_points_ppr,x=reorder(team,next_fantasy_points_ppr,na.rm = TRUE,FUN = median)))+
+  geom_boxplot()+
+  labs(title = "Fantasy Points Grouped by Team",
+       subtitle = "Best and Worst Teams",
+       y = "Fantasy Points next Season",
+       x = "Team",caption = "Fig 2")+
+  theme(axis.text.x = element_text(angle = 45))
+
+
+```
+```{r}
+new_dat %>% 
+ggplot(aes(y = next_fantasy_points_ppr,x=fantasy_pos))+
+  geom_boxplot()+
+  labs(title = "Fantasy Points Grouped by position",
+       y = "Fantasy Points next Season",
+       x = "Position")+
+  theme(axis.text.x = element_text(angle = 45))
+
+
+```
+
+
+```{r}
+tenu <- new_dat
+tenu$tenure <- as.factor(tenu$tenure)
+ggplot(data = tenu, aes(y = next_fantasy_points_ppr,x=age))+
+  geom_boxplot()+
+  labs(title = "Fantasy Points Grouped by Age",
+       y = "Fantasy Points",
+       x = "Age")+
+  theme(axis.text.x = element_text(angle = 45))
+
+ggplot(data = tenu, aes(y = next_fantasy_points_ppr,x=tenure))+
+  geom_boxplot()+
+  labs(title = "Fantasy Points Grouped by Tenure",
+       y = "Fantasy Points",
+       x = "Age")+
+  theme(axis.text.x = element_text(angle = 45))
+
+ggplot(data = tenu, aes(y = next_fantasy_points_ppr,x=year))+
+  geom_boxplot()+
+  labs(title = "Fantasy Points Grouped by Tenure",
+       y = "Fantasy Points",
+       x = "Age")+
+  theme(axis.text.x = element_text(angle = 45))
+```
+
+
+
+
+
+```{r}
+m1 %>%
+spread_draws(b_Intercept, r_team[team,]) %>%
+median_qi(`Group Means` = b_Intercept + r_team) %>%
+ggplot(aes(y = reorder(team, `Group Means`), x = `Group Means`, xmin = .lower, xmax = .upper)) +
+  labs(title = "Team Effects", y = "Team",caption = "Fig 3")+
+geom_pointinterval(orientation = "horizontal")
+
+
+```
+
+```{r}
+m1 %>%
+spread_draws(b_Intercept, r_fantasy_pos[fantasy_pos,]) %>%
+median_qi(`Group Means` = b_Intercept + r_fantasy_pos) %>%
+ggplot(aes(y = fantasy_pos, x = `Group Means`, xmin = .lower, xmax = .upper)) +
+  labs(title = "Fantasy Position Effects", y = "Fantasy Position",caption = "Fig 3")+
+geom_pointinterval(orientation = "horizontal")
+
+
+```
+###Logistic piece
+
+```{r}
+new_dat<- read.csv("D:/Duke/STA 540/football_data.csv")
+new_dat$zero <- as.numeric(new_dat$zero)
+
+pvars <- c("fantasy_points_ppr","apy")
+new_datsc <- new_dat
+new_datsc[pvars] <- lapply(new_datsc[pvars],scale)
+
+
+new_datsc<- new_datsc %>% filter(team != "3TM")
+set.seed(420)
+acc1 = numeric(5)
+acc2 = numeric(5)
+acc3 = numeric(5)
+goodm = numeric(5)
+badm = numeric(5)
+truez = numeric(5)
+true1 = numeric(5)
+cvs = rep(c(1,2,3,4,5), times = length(new_datsc$player)/5)
+cvs = append(cvs,c(1))
+cvs = sample(cvs)
+new_datsc$group = cvs
+data_cv = split(new_datsc, f = new_datsc$group)
+for(i in 1:5){
+  train = data.frame()
+  test = data.frame()
+  for(j in 1:5){
+    if(j != i){
+      train = rbind(train,data_cv[[j]])
+    }
+    else{
+      test = data_cv[[j]]
+    }
+  }
+
+
+ # model1 <-glmer(zero ~ fantasy_points_ppr+(1+apy|fantasy_pos)+age,
+ # family=binomial(link="logit"),
+ # data=train,control=glmerControl(optimizer="bobyqa",
+ #                           optCtrl=list(maxfun=2e5)))
+  
+
+  
+ #model2a <-glmer(zero ~ fantasy_points_ppr+(1|fantasy_pos)+age+apy,
+  #family=binomial(link="logit"),
+  #data=train,control=glmerControl(optimizer="bobyqa",
+                           # optCtrl=list(maxfun=2e5)))
+
+  
+  model3a <-glmer(zero ~ fantasy_points_ppr+(1|fantasy_pos)+age+length+gs,
+  family=binomial(link="logit"),
+  data=train,control=glmerControl(optimizer="bobyqa",
+                            optCtrl=list(maxfun=2e5)))
+
+
+#pred1zero1 <-  as.numeric(predict(model1,test)>=0)
+pred1zero2 <-  as.numeric(predict(model3a,test,type = "response")>=.5)
+
+goodm[i] = mean(pred1zero2==0&test$zero==1)
+badm[i] = mean(pred1zero2==1&test$zero==0)
+truez[i] = mean(pred1zero2==1&test$zero==1)
+true1[i]= mean(pred1zero2==0&test$zero==0)
+print(paste0("Both 0:",mean(pred1zero2==1&test$zero==1)," Both 1: ",mean(pred1zero2==0&test$zero==0)," predicted 0, but not : ",mean(pred1zero2==1&test$zero==0)," predicted 1, but not : ",mean(pred1zero2==0&test$zero==1)))
+#pred1zero3 <-  as.numeric(predict(model3,test)>=0)
+#acc1[i] <- mean(pred1zero1 == test$zero)
+acc2[i] <- mean(pred1zero2 == test$zero)
+#acc3[i] <- mean(pred1zero3 == test$zero)
+}
+```
+
+
+```{r}
+
+new_dat<- read.csv("D:/Duke/STA 540/football_data.csv")
+new_dat$zero <- as.numeric(new_dat$zero)
+
+pvars <- c("fantasy_points_ppr","apy")
+new_datsc <- new_dat
+new_datsc[pvars] <- lapply(new_datsc[pvars],scale)
+
+
+new_datsc<- new_datsc %>% filter(team != "3TM")
+
+
+model2 <-glmer(zero ~ fantasy_points_ppr+(1|fantasy_pos)+age+apy,
+  family=binomial(link="logit"),
+  data=new_datsc,control=glmerControl(optimizer="bobyqa",
+                            optCtrl=list(maxfun=2e5)))
+
+
+new_datsc$is_zero<-  as.numeric(predict(model2,new_datsc,type = "response")>=.5)
+new_datsc2 <- new_datsc %>% filter(is_zero == 0)
+
+cvs = rep(c(1,2,3,4,5), times = length(new_datsc2$player)/5)
+cvs = sample(cvs)
+new_datsc2$group = cvs
+data_cv = split(new_datsc2, f = new_datsc2$group)
+
+rmse_vec1 = numeric(5)
+rmse_vec2 = numeric(5)
+rmse_vec3 = numeric(5)
+rmse_vec4 = numeric(5)
+rmse_vec5 = numeric(5)
+rmse_vec6 = numeric(5)
+ 
+for(i in 1:5){
+  train = data.frame()
+  test = data.frame()
+  for(j in 1:5){
+    if(j != i){
+      train = rbind(train,data_cv[[j]])
+    }
+    else{
+      test = data_cv[[j]]
+    }
+  }
+prior <- c(set_prior("normal(100,40)", class = "Intercept"),
+set_prior("inv_gamma(2.5,20)", class = "sigma"),
+set_prior("inv_gamma(2,5)", class = "sd",group = "team"),
+set_prior("inv_gamma(2,10)", class = "sd",group = "fantasy_pos"))
+
+m1 <- brm(next_fantasy_points_ppr ~ (1 | team)+(1|fantasy_pos)+age+fantasy_points_ppr+apy,
+data = train,prior = prior, family = gaussian(),iter = 2000, warmup = 500,seed =42)
+
+m3 <- brm(next_fantasy_points_ppr ~ (1 | team)+(1+apy|fantasy_pos)+age+fantasy_points_ppr+apy,
+data = train,prior = prior, family = gaussian(),iter = 2000, warmup = 500,seed = 42)
+
+
+pred1 <- predict(m1,test)
+
+pred3 <- predict(m3,test)
+
+
+
+rmse_vec1[i] = rmse(test$next_fantasy_points_ppr,predicted = pred1[,"Estimate"])
+rmse_vec3[i] = rmse(test$next_fantasy_points_ppr,predicted = pred3[,"Estimate"])
+
+}
+```
+
+```{r}
+
+new_dat<- read.csv("D:/Duke/STA 540/football_data.csv")
+new_dat$zero <- as.numeric(new_dat$zero)
+
+pvars <- c("fantasy_points_ppr","apy")
+new_datsc <- new_dat
+new_datsc[pvars] <- lapply(new_datsc[pvars],scale)
+
+
+new_datsc<- new_datsc %>% filter(team != "3TM")
+new_dat<- new_dat %>% filter(team != "3TM")
+
+log_model <-glmer(zero ~ fantasy_points_ppr+(1|fantasy_pos)+age+apy,
+  family=binomial(link="logit"),
+  data=new_datsc,control=glmerControl(optimizer="bobyqa",
+                            optCtrl=list(maxfun=2e5)))
+
+new_datsc$is_zero<-  as.numeric(predict(log_model,new_datsc,type = "response")>=.5)
+new_datsc2 <- new_datsc %>% filter(is_zero == 0)
+new_datsc0 <- new_datsc %>% filter(is_zero == 1)
+new_dat2 <- right_join(new_dat,dplyr::select(new_datsc2,c("player","fantasy_pos","year","is_zero")),by = c("player","fantasy_pos","year"))
+new_dat0 <- right_join(new_dat,dplyr::select(new_datsc0,c("player","fantasy_pos","year","is_zero")),by = c("player","fantasy_pos","year"))
+
+
+prior <- c(set_prior("normal(100,40)", class = "Intercept"),
+set_prior("inv_gamma(2.5,20)", class = "sigma"),
+set_prior("inv_gamma(2,5)", class = "sd",group = "team"),
+set_prior("inv_gamma(2,10)", class = "sd",group = "fantasy_pos"))
+
+m1 <- brm(next_fantasy_points_ppr ~ (1 | team)+(1|fantasy_pos)+age+fantasy_points_ppr+apy,
+data = new_datsc2,prior = prior, family = gaussian(),iter = 2500, warmup = 500,seed =42)
+
+final_pred <- predict(m1,new_datsc2,interval="prediction")
+final_pred0 <-15
+
+new_datsc2$final_pred <-final_pred[,1]
+new_datsc0$final_pred <-final_pred0
+
+final_data <- rbind(new_datsc2,new_datsc0)
+
+```
+```{r}
+m1a <- brm(next_fantasy_points_ppr ~ (1 | team)+(1|fantasy_pos)+age+fantasy_points_ppr+apy,
+data = new_datsc,prior = prior, family = gaussian(),iter = 2500, warmup = 500,seed =42)
+
+final_pred2 <- predict(m1a,new_datsc)
+
+no_log <- new_datsc
+no_log$final_pred <-final_pred2[,1]
+
+```
+
+
+```{r}
+cleaned <- new_dat %>% filter(!(team%in%"3TM"))
+rmse_models <- rmse(final_data$next_fantasy_points_ppr,predicted = final_data$final_pred)
+rmse_naive <- rmse(cleaned$next_fantasy_points_ppr,predicted = cleaned$fantasy_points_ppr)
+rmse_nolog <- rmse(no_log$next_fantasy_points_ppr,predicted = no_log$final_pred)
+```
+$$
+\begin{split}
+\begin{aligned}
+Y_{ij}
+\end{aligned}
+\end{split}
+$$
+```{r}
+
+df_pred <-data.frame(final_pred)
+df_pred$real = new_datsc2$next_fantasy_points_ppr
+
+df_pred0 <- data.frame(Estimate = new_datsc0$final_pred)
+df_pred0$Q2.5 <- -5
+df_pred0$Q97.5 <- 35
+df_pred0$Est.Error <- 4
+df_pred0$real <-new_datsc0$next_fantasy_points_ppr
+
+df_pred <- rbind(df_pred,df_pred0)
+
+df_pred$index = as.numeric(rownames(df_pred))
+
+df_pred<- df_pred %>%
+  mutate(Q2.5 = ifelse((Q2.5< (-5)), -5, Q2.5))%>%
+  mutate(colors = ifelse(((real< Q2.5)|(real>Q97.5)), "red", "black"))%>%
+   mutate(colors2 = ifelse(((real< Q2.5)|(real>Q97.5)), "red", "blue"))
+
+sum(df_pred$colors == "black")/nrow(df_pred)  
+
+set.seed(420)
+samp <- df_pred[sample(nrow(df_pred),100),]
+samp$index <- seq(1,100)
+ggplot(data = samp)+
+  geom_point(aes(x = index, y = Estimate))+
+  geom_errorbar(aes(x = index, y = Estimate,ymin = Q2.5, ymax = Q97.5,color = colors))+
+  geom_point(aes(x = index, y = real,color = colors),shape = 4)+
+  labs(y = "Fantasy Points",x = "", title = "Prediction Intervals for Data",subtitle = "x Shows true value")+
+  scale_color_identity()+theme_bw()+ theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+```
+
+
+```{r}
+df_pred$resids <- df_pred$real-df_pred$Estimate
+df_pred$rand <- sample(nrow(df_pred),nrow(df_pred))
+ggplot(df_pred,aes(y = Estimate, x = real))+geom_point()+
+  labs(title = "Predicted vs. Actual", x= "Actual Fantasy points",
+       y = "Predicted Fantasy Points")
+```
+
+```{r}
+m1 %>%
+  spread_draws(b_Intercept, r_team[team,]) %>%
+  median_qi(`Group Means` = b_Intercept + r_team) %>%
+  ggplot(aes(y = team, x = `Group Means`, xmin = .lower, xmax = .upper)) +
+  geom_pointinterval(orientation = "horizontal")
+
+```
+
+$$
+\begin{split}
+\begin{aligned}
+&IsZero_{ip}|\mathbb{x}_{ip}\sim Bernoulli(\pi_{ip}),\space i = 1,...,n;\space\space p = 1,..,4\\
+&log\left(\frac{\pi_{ip}}{1-\pi_{ip}}\right) = \beta_0+b_{1p}+\beta_1PFP+\beta_2APY+\sum_a \beta_{3a}I(Age = a)\\
+&\beta_0 = \text{Intercept}\\
+&b_{1p} = \text{Random Effect of Position};\space b_{1p}\sim N(0,\sigma^2)\\
+&\beta_1 = \text{Fixed Effect for Previous Year's Fantasy Points}\\
+&\beta_2 = \text{Fixed Effect for Average Salary Per Year}\\
+&\beta_{3a} = \text{Fixed Effect for Age Categories}\\
+\\
+ &(Y_{ipt}|IsZero_{ip} = 0)= \mu +b_{1p}+b_{2t}+ \beta_1PFP+\beta_2APY+\sum_a \beta_{3a}I(Age = a)+\epsilon_{ipt}\\
+&(Y_{ipt}|IsZero_{ip} = 1) = 15\\
+\\
+&\mu = \text{Overall Mean};\space &Prior: \mu\sim N(100,40)\\
+&b_{1p} = \text{Random Effect of Position};\space b_{1p}\sim N(0,\tau^2_p); &Prior: \tau_p^2\sim IG(2,10) \\
+&b_{2t} = \text{Random Effect of Team};\space b_{2t}\sim N(0,\tau^2_t)&Prior: \tau_t^2\sim IG(2,5) \\
+&\epsilon_{ipt}\sim N(0,\sigma^2)\perp b_{1p},b_{2t}& Prior:\sigma^2\sim IG(2.5,150)\\
+\end{aligned}
+\end{split}
+$$
+
+
+$$
+\begin{split}
+\begin{aligned}
+&IsZero_{ip}|\mathbb{x}_{ip}\sim Bernoulli(\pi_{ip}),\space i = 1,...,n;\space\space p = 1,..,4\\
+&log\left(\frac{\pi_{ip}}{1-\pi_{ip}}\right) = \beta_0+b_{1p}+\beta_1PFP+\beta_2APY+\sum_a \beta_{3a}I(Age = a)\\
+&b_{1p} = \text{Random Effect of Position};\space b_{1p}\sim N(0,\sigma^2)\\
+
+ &(Y_{ipt}|IsZero_{ip} = 0)= \mu +b_{1p}+b_{2t}+ \beta_1PFP+\beta_2APY+\sum_a \beta_{3a}I(Age = a)+\epsilon_{ipt}\\
+&(Y_{ipt}|IsZero_{ip} = 1) = 15\\
+\\
+&\mu = \text{Overall Mean};\space &Prior: \mu\sim N(100,40)\\
+&b_{1p} = \text{Random Effect of Position};\space b_{1p}\sim N(0,\tau^2_p); &Prior: \tau_p^2\sim IG(2,10) \\
+&b_{2t} = \text{Random Effect of Team};\space b_{2t}\sim N(0,\tau^2_t)&Prior: \tau_t^2\sim IG(2,5) \\
+&\epsilon_{ipt}\sim N(0,\sigma^2)\perp b_{1p},b_{2t}& Prior:\sigma^2\sim IG(2.5,150)\\
+&Priors\\
+&\mu\sim N(100,40)\\
+&\tau_p^2\sim IG(2,10) \\
+&\tau_t^2\sim IG(2,5) \\
+&\sigma^2\sim IG(2.5,150)\\
+\end{aligned}
+\end{split}
+$$
+```{r}
+library(kableExtra)
+```
+```{r}
+kable(tibble(data.frame("Two Step"= c(5),
+                        "One Step" = c(5),
+                        Naive = c(5),
+                        row.names = c("RMSE"))))
+```
+
+
+
